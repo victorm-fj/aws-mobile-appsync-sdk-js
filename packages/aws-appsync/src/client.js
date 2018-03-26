@@ -7,119 +7,164 @@
  * KIND, express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 import 'setimmediate';
-import ApolloClient, { ApolloClientOptions, MutationOptions } from 'apollo-client';
+import ApolloClient, {
+	ApolloClientOptions,
+	MutationOptions,
+} from 'apollo-client';
 import { InMemoryCache } from 'apollo-cache-inmemory';
 import { ApolloLink, FetchResult } from 'apollo-link';
 import { HttpLink } from 'apollo-link-http';
-import { getMainDefinition, getOperationDefinition, variablesInOperation } from 'apollo-utilities';
+import {
+	getMainDefinition,
+	getOperationDefinition,
+	variablesInOperation,
+} from 'apollo-utilities';
 
 import OfflineCache from './cache/index';
-import { OfflineLink, AuthLink, NonTerminatingHttpLink, SubscriptionHandshakeLink, ComplexObjectLink } from './link';
+import {
+	OfflineLink,
+	AuthLink,
+	NonTerminatingHttpLink,
+	SubscriptionHandshakeLink,
+	ComplexObjectLink,
+} from './link';
 import { createStore } from './store';
 
 class AWSAppSyncClient extends ApolloClient {
+	/**
+	 * @type {Promise<AWSAppSyncClient>}
+	 */
+	hydratedPromise;
 
-    /**
-     * @type {Promise<AWSAppSyncClient>}
-     */
-    hydratedPromise;
+	hydrated = () => this.hydratedPromise;
 
-    hydrated = () => this.hydratedPromise;
+	/**
+	 *
+	 * @param {string} url
+	 * @param {ApolloClientOptions<InMemoryCache>} options
+	 */
+	constructor(
+		{
+			url,
+			region,
+			auth,
+			conflictResolver,
+			complexObjectsCredentials,
+			disableOffline = false,
+			link: ownLink,
+			cache: ownCache,
+		},
+		options
+	) {
+		if (!url || !region || !auth) {
+			throw new Error(
+				'In order to initialize AWSAppSyncClient, you must specify url, region and auth properties on the config object.'
+			);
+		}
 
-    /**
-     *
-     * @param {string} url
-     * @param {ApolloClientOptions<InMemoryCache>} options
-     */
-    constructor({ url, region, auth, conflictResolver, complexObjectsCredentials, disableOffline = false }, options) {
-        if (!url || !region || !auth) {
-            throw new Error(
-                'In order to initialize AWSAppSyncClient, you must specify url, region and auth properties on the config object.'
-            );
-        }
+		let res;
+		this.hydratedPromise = new Promise((resolve, reject) => {
+			res = resolve;
+		});
 
-        let res;
-        this.hydratedPromise = new Promise((resolve, reject) => {
-            res = resolve;
-        });
+		const store =
+			disableOffline || ownCache
+				? null
+				: createStore(
+						this,
+						() => {
+							store.dispatch({ type: 'REHYDRATE_STORE' });
+							res(this);
+						},
+						conflictResolver
+				  );
+		const cache = disableOffline
+			? ownCache ? ownCache : new InMemoryCache()
+			: ownCache ? ownCache : new OfflineCache(store);
 
-        const store = disableOffline ? null : createStore(
-            this,
-            () => {
-                store.dispatch({ type: 'REHYDRATE_STORE' });
-                res(this);
-            },
-            conflictResolver,
-        );
-        const cache = disableOffline ? new InMemoryCache() : new OfflineCache(store);
+		const passthrough = (op, forward) =>
+			forward ? forward(op) : Observable.of();
+		let link = ownLink
+			? ownLink
+			: ApolloLink.from([
+					disableOffline ? passthrough : new OfflineLink(store),
+					new ComplexObjectLink(complexObjectsCredentials),
+					new AuthLink({ url, region, auth }),
+					ApolloLink.split(
+						operation => {
+							const { query } = operation;
+							const { kind, operation: graphqlOperation } = getMainDefinition(
+								query
+							);
+							const isSubscription =
+								kind === 'OperationDefinition' &&
+								graphqlOperation === 'subscription';
 
-        const passthrough = (op, forward) => (forward ? forward(op) : Observable.of());
-        let link = ApolloLink.from([
-            disableOffline ? passthrough : new OfflineLink(store),
-            new ComplexObjectLink(complexObjectsCredentials),
-            new AuthLink({ url, region, auth }),
-            ApolloLink.split(
-                operation => {
-                    const { query } = operation;
-                    const { kind, operation: graphqlOperation } = getMainDefinition(query);
-                    const isSubscription = kind === 'OperationDefinition' && graphqlOperation === 'subscription';
+							return isSubscription;
+						},
+						ApolloLink.from([
+							new NonTerminatingHttpLink('subsInfo', { uri: url }, true),
+							new SubscriptionHandshakeLink('subsInfo'),
+						]),
+						new HttpLink({ uri: url })
+					),
+			  ]);
 
-                    return isSubscription;
-                },
-                ApolloLink.from([
-                    new NonTerminatingHttpLink('subsInfo', { uri: url }, true),
-                    new SubscriptionHandshakeLink('subsInfo'),
-                ]),
-                new HttpLink({ uri: url }),
-            ),
-        ]);
+		const newOptions = {
+			...options,
+			link,
+			cache,
+		};
 
-        const newOptions = {
-            ...options,
-            link,
-            cache,
-        };
+		super(newOptions);
 
-        super(newOptions);
+		if (disableOffline) {
+			res(this);
+		}
+	}
 
-        if (disableOffline) {
-            res(this);
-        }
-    }
+	/**
+	 *
+	 * @param {MutationOptions} options
+	 * @returns {Promise<FetchResult>}
+	 */
+	mutate(options) {
+		const {
+			update,
+			refetchQueries,
+			context: origContext = {},
+			...otherOptions
+		} = options;
+		const {
+			AASContext: { doIt = false, ...restAASContext } = {},
+		} = origContext;
 
-    /**
-     *
-     * @param {MutationOptions} options
-     * @returns {Promise<FetchResult>}
-     */
-    mutate(options) {
-        const { update, refetchQueries, context: origContext = {}, ...otherOptions } = options;
-        const { AASContext: { doIt = false, ...restAASContext } = {} } = origContext;
+		const context = {
+			...origContext,
+			AASContext: {
+				doIt,
+				...restAASContext,
+				...(!doIt ? { refetchQueries, update } : {}),
+			},
+		};
 
-        const context = {
-            ...origContext,
-            AASContext: {
-                doIt,
-                ...restAASContext,
-                ...(!doIt ? { refetchQueries, update } : {}),
-            }
-        };
+		const { optimisticResponse, variables } = otherOptions;
+		const data =
+			optimisticResponse &&
+			(typeof optimisticResponse === 'function'
+				? { ...optimisticResponse(variables) }
+				: optimisticResponse);
 
-        const { optimisticResponse, variables } = otherOptions;
-        const data = optimisticResponse &&
-            (typeof optimisticResponse === 'function' ? { ...optimisticResponse(variables) } : optimisticResponse);
+		const newOptions = {
+			...otherOptions,
+			optimisticResponse: data,
+			update,
+			...(doIt ? { refetchQueries } : {}),
+			context,
+		};
 
-        const newOptions = {
-            ...otherOptions,
-            optimisticResponse: data,
-            update,
-            ...(doIt ? { refetchQueries } : {}),
-            context,
-        }
-
-        return super.mutate(newOptions);
-    }
-
-};
+		return super.mutate(newOptions);
+	}
+}
 
 export { AWSAppSyncClient };
